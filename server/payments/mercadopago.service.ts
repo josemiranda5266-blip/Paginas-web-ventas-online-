@@ -2,16 +2,21 @@
  * Mercado Pago Multi-Tenant Payment Adapter & Service
  * 
  * Arquitectura y Principios:
- * 1. OAuth por comercio (Cada comercio autoriza SU propia cuenta).
- * 2. Cero comisiones de venta descontadas por nuestra app (100% de la venta va a la cuenta del comercio).
- * 3. Encriptación AES-256-GCM de access tokens y refresh tokens en almacenamiento.
- * 4. Creación de checkout preferences con el Access Token del comercio.
- * 5. Verificación criptográfica de firma de Webhooks (HMAC-SHA256).
- * 6. Normalización e idempotencia estricta de eventos de pago.
+ * 1. OAuth por comercio (Cada comercio conecta y autoriza SU propia cuenta).
+ * 2. Cero comisiones de venta cobradas por la plataforma (100% de la venta va a la cuenta del comercio).
+ * 3. Encriptación AES-256-GCM de access tokens y refresh tokens en base de datos.
+ * 4. Mercado Pago Checkout API -> API de Orders (/v1/orders).
+ * 5. Verificación criptográfica de firma de Webhooks (HMAC-SHA256 timingSafeEqual).
+ * 6. Idempotencia y trazabilidad transaccional en PostgreSQL.
  */
 
 import { PaymentStatus } from '../../src/types/index.ts';
-import { CreatePreferenceOptions, MercadoPagoOAuthTokenResponse, PaymentWebhookResult } from './types.ts';
+import {
+  CreateMercadoPagoOrderOptions,
+  MercadoPagoOrderResponse,
+  MercadoPagoOAuthTokenResponse,
+  PaymentWebhookResult,
+} from './types.ts';
 import {
   encryptToken,
   decryptToken,
@@ -129,72 +134,160 @@ export class MercadoPagoService {
   }
 
   /**
-   * Crea una preferencia de pago en la cuenta del comercio usando SU propio Access Token.
-   * Cero marketplace_fee (100% de los fondos van directo al comercio).
+   * Crea una orden en Mercado Pago utilizando la API Oficial de Orders (/v1/orders)
+   * con el Access Token propio del comercio.
+   * Cero comisión sobre ventas (marketplace_fee = 0).
    */
-  public async createPreference(
+  public async createOrder(
     encryptedStoreAccessToken: string,
-    options: CreatePreferenceOptions
-  ): Promise<{ preferenceId: string; initPoint: string; sandboxInitPoint: string }> {
+    options: CreateMercadoPagoOrderOptions
+  ): Promise<MercadoPagoOrderResponse> {
     const storeAccessToken = decryptToken(encryptedStoreAccessToken);
     
     if (!storeAccessToken) {
       throw new Error('El comercio no tiene un Access Token de Mercado Pago válido o conectado.');
     }
 
-    // Modo Sandbox / Demo simulado si el token es de prueba local
-    if (storeAccessToken.startsWith('TEST_MOCK_TOKEN_') || storeAccessToken.startsWith('SANDBOX_DEMO_')) {
-      const mockPrefId = `pref-sandbox-${options.storeId}-${Date.now()}`;
-      return {
-        preferenceId: mockPrefId,
-        initPoint: `${options.backUrls.success}&preference_id=${mockPrefId}&status=approved`,
-        sandboxInitPoint: `${options.backUrls.success}&preference_id=${mockPrefId}&status=approved`,
-      };
-    }
-
-    const payload = {
+    // Estructura oficial de Mercado Pago Orders API
+    const orderPayload = {
+      type: 'online',
+      external_reference: options.orderId,
+      total_amount: Number(options.totalAmount),
       items: options.items.map((item) => ({
         id: item.id,
         title: item.title,
-        description: item.description || '',
-        quantity: item.quantity,
+        description: item.description || item.title,
+        quantity: Number(item.quantity),
         unit_price: Number(item.unitPrice),
         currency_id: 'ARS',
         picture_url: item.pictureUrl,
       })),
       payer: {
-        name: options.payer.name,
-        surname: options.payer.surname,
         email: options.payer.email,
+        first_name: options.payer.name,
+        last_name: options.payer.surname,
         phone: options.payer.phone ? { number: options.payer.phone } : undefined,
       },
-      back_urls: options.backUrls,
-      auto_return: 'approved',
       notification_url: options.notificationUrl,
-      external_reference: options.orderId,
-      statement_descriptor: `Tienda ${options.storeId}`,
-      marketplace_fee: 0, // 0% de comisión de plataforma en ventas
+      back_urls: options.backUrls,
+      statement_descriptor: options.storeName ? `Tienda ${options.storeName}` : `Tienda ${options.storeId}`,
     };
 
-    const response = await fetch('https://api.mercadopago.com/checkout/preferences', {
+    // Modo Sandbox / Dev Token
+    if (storeAccessToken.startsWith('TEST_MOCK_TOKEN_') || storeAccessToken.startsWith('SANDBOX_DEMO_')) {
+      const mockMpOrderId = `mp-ord-sandbox-${options.orderId}-${Date.now()}`;
+      const mockInitPoint = `${options.backUrls.success}&mp_order_id=${mockMpOrderId}&status=approved`;
+      return {
+        orderId: options.orderId,
+        mpOrderId: mockMpOrderId,
+        status: 'opened',
+        initPoint: mockInitPoint,
+        sandboxInitPoint: mockInitPoint,
+        externalReference: options.orderId,
+        totalAmount: options.totalAmount,
+        rawResponse: { simulated: true, payload: orderPayload },
+      };
+    }
+
+    const response = await fetch('https://api.mercadopago.com/v1/orders', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${storeAccessToken}`,
+        'X-Idempotency-Key': `order-${options.orderId}`,
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(orderPayload),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Error creando preferencia de Mercado Pago: ${response.status} - ${errorText}`);
+      throw new Error(`Error creando Orden en Mercado Pago (/v1/orders): ${response.status} - ${errorText}`);
     }
 
-    const result = (await response.json()) as { id: string; init_point: string; sandbox_init_point: string };
+    const result = (await response.json()) as {
+      id: string;
+      status: string;
+      init_point?: string;
+      checkout_url?: string;
+      sandbox_init_point?: string;
+      external_reference?: string;
+      total_amount?: number;
+      [key: string]: unknown;
+    };
+
+    const initPoint = result.init_point || result.checkout_url || '';
+    const sandboxInitPoint = result.sandbox_init_point || initPoint;
+
     return {
-      preferenceId: result.id,
-      initPoint: result.init_point,
-      sandboxInitPoint: result.sandbox_init_point || result.init_point,
+      orderId: options.orderId,
+      mpOrderId: String(result.id),
+      status: result.status || 'opened',
+      initPoint,
+      sandboxInitPoint,
+      externalReference: result.external_reference || options.orderId,
+      totalAmount: result.total_amount || options.totalAmount,
+      rawResponse: result,
+    };
+  }
+
+  /**
+   * Consulta una Orden en Mercado Pago (/v1/orders/{id} o /merchant_orders/{id})
+   */
+  public async fetchOrder(
+    encryptedStoreAccessToken: string,
+    mpOrderId: string
+  ): Promise<{ id: string; status: string; payments: Array<{ id: string; status: string; amount: number }>; externalReference?: string }> {
+    const storeAccessToken = decryptToken(encryptedStoreAccessToken);
+    
+    if (!storeAccessToken) {
+      throw new Error('Access Token del comercio no disponible.');
+    }
+
+    if (mpOrderId.startsWith('mp-ord-sandbox-') || storeAccessToken.startsWith('SANDBOX_DEMO_')) {
+      return {
+        id: mpOrderId,
+        status: 'closed',
+        payments: [{ id: `pay-sim-${Date.now()}`, status: 'approved', amount: 100 }],
+      };
+    }
+
+    // Consultar Orden en Mercado Pago
+    const response = await fetch(`https://api.mercadopago.com/v1/orders/${mpOrderId}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${storeAccessToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      // Fallback a merchant_orders si la orden fue creada bajo esquema merchant_order
+      const moRes = await fetch(`https://api.mercadopago.com/merchant_orders/${mpOrderId}`, {
+        headers: { Authorization: `Bearer ${storeAccessToken}` },
+      });
+      if (!moRes.ok) {
+        throw new Error(`Error consultando Orden de Mercado Pago: ${response.status}`);
+      }
+      const moData = (await moRes.json()) as { id: number | string; status: string; payments?: Array<{ id: number; status: string; transaction_amount: number }>; external_reference?: string };
+      return {
+        id: String(moData.id),
+        status: moData.status,
+        externalReference: moData.external_reference,
+        payments: (moData.payments || []).map((p) => ({ id: String(p.id), status: p.status, amount: p.transaction_amount })),
+      };
+    }
+
+    const data = (await response.json()) as {
+      id: string;
+      status: string;
+      external_reference?: string;
+      payments?: Array<{ id: string; status: string; transaction_amount: number }>;
+    };
+
+    return {
+      id: String(data.id),
+      status: data.status,
+      externalReference: data.external_reference,
+      payments: (data.payments || []).map((p) => ({ id: String(p.id), status: p.status, amount: p.transaction_amount })),
     };
   }
 
@@ -239,11 +332,13 @@ export class MercadoPagoService {
       status: string;
       transaction_amount: number;
       external_reference?: string;
+      order?: { id?: string };
       [key: string]: unknown;
     };
 
     return {
       paymentId: String(data.id),
+      mpOrderId: data.order?.id ? String(data.order.id) : undefined,
       orderId: data.external_reference,
       status: this.normalizePaymentStatus(data.status),
       provider: 'MERCADOPAGO',

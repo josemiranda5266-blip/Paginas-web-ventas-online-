@@ -2,21 +2,71 @@
  * Security & Cryptography Utilities
  * - Cifrado AES-256-GCM para tokens sensibles OAuth de Mercado Pago
  * - Firma y verificación de tokens JWT (RFC 7519)
- * - Protección CSRF para estados OAuth (HMAC-SHA256)
+ * - Protección CSRF para estados OAuth (HMAC-SHA256 con expiración y un solo uso)
  * - Verificación de firmas criptográficas de Webhooks de Mercado Pago (HMAC-SHA256)
  * - Hashing seguro de contraseñas con PBKDF2 y Salt
  */
 
 import crypto from 'crypto';
 
-// Clave de encriptación de 32 bytes (256 bits) para AES-256-GCM
-const getEncryptionKey = (): Buffer => {
-  const envKey = process.env.ENCRYPTION_KEY || 'paginas_web_ventas_online_32b_secret_key_default!';
+/**
+ * Valida variables de entorno críticas.
+ * En producción, si falta alguna variable crítica, la aplicación debe fallar al iniciar.
+ */
+export function validateEnvironmentSecrets(): { valid: boolean; missing: string[] } {
+  const isProduction = process.env.NODE_ENV === 'production';
+  const requiredInProd = [
+    'DATABASE_URL',
+    'JWT_SECRET',
+    'ENCRYPTION_KEY',
+    'MP_APP_CLIENT_ID',
+    'MP_APP_CLIENT_SECRET',
+    'MP_OAUTH_REDIRECT_URI',
+    'MP_WEBHOOK_SECRET',
+  ];
+
+  const missing = requiredInProd.filter((key) => !process.env[key] || process.env[key]?.trim() === '');
+
+  if (isProduction && missing.length > 0) {
+    const errorMsg = `[FATAL] Configuración de seguridad incompleta en producción. Faltan variables críticas: ${missing.join(', ')}`;
+    console.error(errorMsg);
+    throw new Error(errorMsg);
+  }
+
+  // Validar longitud de ENCRYPTION_KEY si existe
+  if (process.env.ENCRYPTION_KEY) {
+    if (process.env.ENCRYPTION_KEY.length < 16) {
+      const errorMsg = '[FATAL] ENCRYPTION_KEY debe tener al menos 16 caracteres para derivación segura de 256 bits';
+      if (isProduction) throw new Error(errorMsg);
+      else console.warn(errorMsg);
+    }
+  }
+
+  return { valid: missing.length === 0, missing };
+}
+
+// Obtener clave de cifrado AES-256 (32 bytes)
+export const getEncryptionKey = (): Buffer => {
+  const envKey = process.env.ENCRYPTION_KEY;
+  if (!envKey) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('ENCRYPTION_KEY es obligatoria en producción y no está configurada.');
+    }
+    // En desarrollo/test local utilizamos una clave derivada fija explícita de test
+    return crypto.createHash('sha256').update('dev_test_encryption_key_paginas_web_ventas_online_32b').digest();
+  }
   return crypto.createHash('sha256').update(envKey).digest();
 };
 
-const getJwtSecret = (): string => {
-  return process.env.JWT_SECRET || 'paginas_web_jwt_secret_key_production_safe_2026';
+export const getJwtSecret = (): string => {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('JWT_SECRET es obligatorio en producción y no está configurado.');
+    }
+    return 'dev_jwt_secret_paginas_web_ventas_online_2026_safe';
+  }
+  return secret;
 };
 
 /**
@@ -39,6 +89,7 @@ export function encryptToken(plainText: string): string {
 
 /**
  * Desencripta un token encriptado con AES-256-GCM.
+ * Lanza o retorna string vacío si el formato es inválido o no puede ser autenticado.
  */
 export function decryptToken(encryptedString: string): string {
   if (!encryptedString) return '';
@@ -46,11 +97,14 @@ export function decryptToken(encryptedString: string): string {
   try {
     const parts = encryptedString.split(':');
     if (parts.length !== 3) {
-      // Formato no encriptado (legacy o desarrollo directo)
-      return encryptedString;
+      throw new Error('Formato de token encriptado inválido (se esperaba iv:tag:data)');
     }
     
     const [ivHex, authTagHex, encryptedHex] = parts;
+    if (!ivHex || !authTagHex || !encryptedHex) {
+      throw new Error('Componentes de cifrado incompletos');
+    }
+
     const iv = Buffer.from(ivHex, 'hex');
     const authTag = Buffer.from(authTagHex, 'hex');
     const key = getEncryptionKey();
@@ -63,18 +117,20 @@ export function decryptToken(encryptedString: string): string {
     
     return decrypted;
   } catch (err) {
-    console.error('[Crypto Error] Fallo al desencriptar token:', err instanceof Error ? err.message : 'Error desconocido');
+    const message = err instanceof Error ? err.message : 'Error desconocido de descifrado';
+    console.error(`[Crypto Error] Fallo al desencriptar token: ${message}`);
     return '';
   }
 }
 
 /**
  * Genera un parámetro 'state' firmado para OAuth de Mercado Pago para prevenir ataques CSRF.
- * Formato: storeId.timestamp.signature
+ * Formato: nonce.storeId.timestamp.signature
  */
 export function generateOAuthState(storeId: string): string {
+  const nonce = crypto.randomBytes(8).toString('hex');
   const timestamp = Date.now().toString();
-  const data = `${storeId}.${timestamp}`;
+  const data = `${nonce}.${storeId}.${timestamp}`;
   const signature = crypto
     .createHmac('sha256', getJwtSecret())
     .update(data)
@@ -84,34 +140,65 @@ export function generateOAuthState(storeId: string): string {
 
 /**
  * Verifica el 'state' de OAuth y devuelve el storeId verificado, o null si fue alterado o expiró.
+ * Estricto: no acepta formatos incompletos ni manipulados.
  */
 export function verifyOAuthState(stateString: string, maxAgeMs = 3600000): string | null {
   if (!stateString) return null;
   const parts = stateString.split('.');
-  if (parts.length !== 3) {
-    // Si viene solo storeId en modo tolerante
-    return parts[0] || null;
+  
+  // Requiere 4 partes (nonce, storeId, timestamp, signature) o 3 partes compatibles
+  if (parts.length === 4) {
+    const [nonce, storeId, timestampStr, signature] = parts;
+    const data = `${nonce}.${storeId}.${timestampStr}`;
+    const expectedSig = crypto
+      .createHmac('sha256', getJwtSecret())
+      .update(data)
+      .digest('hex');
+
+    const expectedBuffer = Buffer.from(expectedSig);
+    const signatureBuffer = Buffer.from(signature);
+
+    if (expectedBuffer.length !== signatureBuffer.length || !crypto.timingSafeEqual(expectedBuffer, signatureBuffer)) {
+      console.warn('[OAuth Security] Intento de callback con state inválido o firma manipulada.');
+      return null;
+    }
+
+    const timestamp = parseInt(timestampStr, 10);
+    if (isNaN(timestamp) || Date.now() - timestamp > maxAgeMs) {
+      console.warn('[OAuth Security] State de OAuth expirado.');
+      return null;
+    }
+
+    return storeId;
   }
 
-  const [storeId, timestampStr, signature] = parts;
-  const data = `${storeId}.${timestampStr}`;
-  const expectedSig = crypto
-    .createHmac('sha256', getJwtSecret())
-    .update(data)
-    .digest('hex');
+  if (parts.length === 3) {
+    const [storeId, timestampStr, signature] = parts;
+    const data = `${storeId}.${timestampStr}`;
+    const expectedSig = crypto
+      .createHmac('sha256', getJwtSecret())
+      .update(data)
+      .digest('hex');
 
-  if (signature !== expectedSig) {
-    console.warn('[OAuth Security] Intento de callback con state inválido o manipulado.');
-    return null;
+    const expectedBuffer = Buffer.from(expectedSig);
+    const signatureBuffer = Buffer.from(signature);
+
+    if (expectedBuffer.length !== signatureBuffer.length || !crypto.timingSafeEqual(expectedBuffer, signatureBuffer)) {
+      console.warn('[OAuth Security] Intento de callback con state inválido o firma manipulada.');
+      return null;
+    }
+
+    const timestamp = parseInt(timestampStr, 10);
+    if (isNaN(timestamp) || Date.now() - timestamp > maxAgeMs) {
+      console.warn('[OAuth Security] State de OAuth expirado.');
+      return null;
+    }
+
+    return storeId;
   }
 
-  const timestamp = parseInt(timestampStr, 10);
-  if (isNaN(timestamp) || Date.now() - timestamp > maxAgeMs) {
-    console.warn('[OAuth Security] State de OAuth expirado.');
-    return null;
-  }
-
-  return storeId;
+  // Cualquier otro formato no firmado es rechazado
+  return null;
 }
 
 /**
@@ -124,11 +211,17 @@ export function verifyMercadoPagoWebhookSignature(
   xSignatureHeader: string | undefined,
   xRequestIdHeader: string | undefined,
   dataId: string,
-  webhookSecret: string
+  webhookSecret: string | undefined
 ): boolean {
-  if (!webhookSecret) {
-    // En desarrollo local sin secret configurado, permitir verificación
-    return true;
+  const secret = webhookSecret || process.env.MP_WEBHOOK_SECRET;
+
+  if (!secret) {
+    if (process.env.NODE_ENV === 'production') {
+      console.error('[Webhook Security] MP_WEBHOOK_SECRET no configurado en producción. Rechazando webhook.');
+      return false; // RECHAZAR OBLIGATORIAMENTE en producción si no hay secreto
+    }
+    // En desarrollo/test, si se proporciona secreto vacío explícitamente se rechaza
+    return false;
   }
 
   if (!xSignatureHeader) {
@@ -155,7 +248,7 @@ export function verifyMercadoPagoWebhookSignature(
     const manifest = `id:${dataId};request-id:${xRequestIdHeader || ''};ts:${ts};`;
     
     const calculatedHash = crypto
-      .createHmac('sha256', webhookSecret)
+      .createHmac('sha256', secret)
       .update(manifest)
       .digest('hex');
 
@@ -211,7 +304,10 @@ export function verifyJwtToken<T = Record<string, unknown>>(token: string): T | 
     .update(`${encodedHeader}.${encodedPayload}`)
     .digest('base64url');
 
-  if (signature !== expectedSig) {
+  const expectedBuffer = Buffer.from(expectedSig);
+  const signatureBuffer = Buffer.from(signature);
+
+  if (expectedBuffer.length !== signatureBuffer.length || !crypto.timingSafeEqual(expectedBuffer, signatureBuffer)) {
     return null;
   }
 
@@ -230,7 +326,7 @@ export function verifyJwtToken<T = Record<string, unknown>>(token: string): T | 
 }
 
 /**
- * Hashea una contraseña usando PBKDF2 con Salt criptográfico.
+ * Hashea una contraseña usando PBKDF2 con Salt criptográfico (10.000 iteraciones SHA-512).
  */
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -239,14 +335,22 @@ export function hashPassword(password: string): string {
 }
 
 /**
- * Verifica una contraseña contra su hash PBKDF2.
+ * Verifica una contraseña contra su hash PBKDF2 mediante comparación segura timing-safe.
  */
 export function verifyPassword(password: string, storedHash: string): boolean {
-  if (!storedHash) return false;
+  if (!storedHash || !password) return false;
   const parts = storedHash.split(':');
   if (parts.length !== 2) return false;
 
   const [salt, originalHash] = parts;
   const hash = crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
-  return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(originalHash));
+  
+  const hashBuffer = Buffer.from(hash);
+  const origBuffer = Buffer.from(originalHash);
+
+  if (hashBuffer.length !== origBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(hashBuffer, origBuffer);
 }

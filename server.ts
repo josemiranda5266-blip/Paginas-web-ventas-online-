@@ -5,7 +5,6 @@
 
 import express from 'express';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 
 // Middlewares
@@ -20,13 +19,22 @@ import { productRouter } from './server/routes/product.routes.ts';
 import { orderRouter } from './server/routes/order.routes.ts';
 import { paymentRouter } from './server/routes/payment.routes.ts';
 import { adminRouter } from './server/routes/admin.routes.ts';
+import { testRouter } from './server/routes/test.routes.ts';
+import { db } from './server/db/index.ts';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname = process.cwd();
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
+
+  // 0. Sembrar datos iniciales en la base de datos PostgreSQL
+  try {
+    await db.seedInitialData();
+    console.log('[Paginas Web Ventas Online] Base de datos inicializada y sembrada exitosamente.');
+  } catch (err) {
+    console.warn('[Paginas Web Ventas Online] Advertencia al sembrar base de datos:', err);
+  }
 
   // 1. Middlewares de Seguridad y Parsing
   app.use(securityHeadersMiddleware);
@@ -57,6 +65,7 @@ async function startServer() {
   app.use('/api/orders', orderRouter);
   app.use('/api/payments', paymentRouter);
   app.use('/api/admin', adminRouter);
+  app.use('/api/tests', testRouter);
 
   // 5. Manejador Centralizado de Errores
   app.use(errorHandlerMiddleware);

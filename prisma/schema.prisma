@@ -374,3 +374,18 @@ model Subscription {
   @@index([status])
 }
 
+// 16. Estado de OAuth Criptográfico de Un Solo Uso (CSRF & Replay Prevention)
+model OAuthState {
+  id        String   @id @default(uuid())
+  state     String   @unique
+  storeId   String
+  userId    String?
+  used      Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([state])
+  @@index([storeId])
+}
+
+

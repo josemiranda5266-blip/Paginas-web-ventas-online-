@@ -1,13 +1,14 @@
 /**
  * Authentication Middleware & Role-Based Authorization
+ * - Verificación criptográfica obligatoria de tokens JWT (RFC 7519)
+ * - Cero fallbacks a IDs o emails planos
+ * - Contexto tipado en Express.Request
  */
 
 import { Request, Response, NextFunction } from 'express';
 import { UserRole } from '../../src/types/index.ts';
-import { db } from '../db/index.ts';
 import { verifyJwtToken } from '../utils/crypto.ts';
 
-// Extender tipos de Request de Express para incluir contexto del usuario autenticado
 export interface AuthenticatedUser {
   id: string;
   email: string;
@@ -40,7 +41,7 @@ export function authMiddleware(req: Request, _res: Response, next: NextFunction)
     return;
   }
 
-  // 1. Intento de verificación con JWT criptográfico
+  // Verificación estricta con JWT criptográfico
   const jwtPayload = verifyJwtToken<AuthenticatedUser>(token);
   if (jwtPayload && jwtPayload.id && jwtPayload.role) {
     req.user = {
@@ -49,21 +50,6 @@ export function authMiddleware(req: Request, _res: Response, next: NextFunction)
       name: String(jwtPayload.name || ''),
       role: jwtPayload.role as UserRole,
       storeId: jwtPayload.storeId ? String(jwtPayload.storeId) : undefined,
-    };
-    next();
-    return;
-  }
-
-  // 2. Búsqueda directa en base de datos (compatibilidad con IDs o tokens de prueba)
-  const user = db.users.find((u) => u.id === token || u.email === token);
-
-  if (user) {
-    req.user = {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      role: user.role,
-      storeId: user.storeId,
     };
   }
 
@@ -76,7 +62,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
       success: false,
       error: {
         code: 'UNAUTHORIZED',
-        message: 'Acceso no autorizado. Debe iniciar sesión.',
+        message: 'Acceso no autorizado. Debe iniciar sesión con un token válido.',
       },
     });
     return;

@@ -11,30 +11,33 @@
 import { Request, Response, NextFunction } from 'express';
 import { db } from '../db/index.ts';
 
-export function resolveTenant(req: Request, _res: Response, next: NextFunction): void {
-  // Extraer storeId o slug de headers o parámetros de ruta
-  const headerStoreId = req.headers['x-store-id'] as string;
-  const headerSlug = req.headers['x-tenant-slug'] as string;
-  const paramSlug = req.params.storeSlug || req.params.slug;
-  const paramStoreId = req.params.storeId;
+export async function resolveTenant(req: Request, _res: Response, next: NextFunction): Promise<void> {
+  try {
+    const headerStoreId = req.headers['x-store-id'] as string;
+    const headerSlug = req.headers['x-tenant-slug'] as string;
+    const paramSlug = req.params.storeSlug || req.params.slug;
+    const paramStoreId = req.params.storeId;
 
-  let storeId = headerStoreId || paramStoreId;
+    let storeId = headerStoreId || paramStoreId;
 
-  if (!storeId && (headerSlug || paramSlug)) {
-    const slug = headerSlug || paramSlug;
-    const store = db.stores.find((s) => s.slug === slug);
-    if (store) {
-      storeId = store.id;
+    if (!storeId && (headerSlug || paramSlug)) {
+      const slug = headerSlug || paramSlug;
+      const store = await db.findStoreBySlug(slug);
+      if (store) {
+        storeId = store.id;
+      }
     }
-  }
 
-  // Si el usuario autenticado es ADMIN_COMERCIO, su storeId autorizado prevalece
-  if (req.user && req.user.role === 'ADMIN_COMERCIO' && req.user.storeId) {
-    storeId = req.user.storeId;
-  }
+    // Si el usuario autenticado es ADMIN_COMERCIO, su storeId autorizado prevalece
+    if (req.user && req.user.role === 'ADMIN_COMERCIO' && req.user.storeId) {
+      storeId = req.user.storeId;
+    }
 
-  req.storeId = storeId || undefined;
-  next();
+    req.storeId = storeId || undefined;
+    next();
+  } catch (err) {
+    next(err);
+  }
 }
 
 /**
@@ -124,33 +127,41 @@ export function enforceTenantIsolation(req: Request, res: Response, next: NextFu
 /**
  * Verifica si la tienda está activa antes de procesar operaciones públicas (e.g. checkout).
  */
-export function requireActiveStore(req: Request, res: Response, next: NextFunction): void {
-  const storeId = req.params.storeId || req.storeId || req.body?.storeId;
-  
-  if (!storeId) {
+export async function requireActiveStore(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const storeId = req.params.storeId || req.storeId || req.body?.storeId;
+    
+    if (!storeId) {
+      next();
+      return;
+    }
+
+    let store: any = await db.findStoreById(storeId);
+    if (!store) {
+      store = await db.findStoreBySlug(storeId);
+    }
+
+    if (!store) {
+      res.status(404).json({
+        success: false,
+        error: { code: 'STORE_NOT_FOUND', message: 'El comercio solicitado no existe.' },
+      });
+      return;
+    }
+
+    if (store.status === 'SUSPENDIDO') {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: 'STORE_SUSPENDED',
+          message: 'Esta tienda se encuentra temporalmente suspendida y no acepta pedidos.',
+        },
+      });
+      return;
+    }
+
     next();
-    return;
+  } catch (err) {
+    next(err);
   }
-
-  const store = db.stores.find((s) => s.id === storeId || s.slug === storeId);
-  if (!store) {
-    res.status(404).json({
-      success: false,
-      error: { code: 'STORE_NOT_FOUND', message: 'El comercio solicitado no existe.' },
-    });
-    return;
-  }
-
-  if (store.status === 'SUSPENDIDO') {
-    res.status(403).json({
-      success: false,
-      error: {
-        code: 'STORE_SUSPENDED',
-        message: 'Esta tienda se encuentra temporalmente suspendida y no acepta pedidos.',
-      },
-    });
-    return;
-  }
-
-  next();
 }

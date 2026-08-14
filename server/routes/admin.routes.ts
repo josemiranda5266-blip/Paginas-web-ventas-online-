@@ -1,293 +1,223 @@
 /**
- * SuperAdmin Routes
- * Gestión global de comercios, suspensión/activación, planes de suscripción y auditoría.
+ * Admin Routes (SuperAdmin & Platform Management)
+ * - Gestión global de tiendas (crear, suspender, activar)
+ * - Gestión de suscripciones SaaS (0% de comisión en ventas)
+ * - Registros de auditoría (Audit Logs)
+ * - Métricas globales de la plataforma
  */
 
 import { Router, Request, Response } from 'express';
 import { db } from '../db/index.ts';
 import { requireAuth, requireSuperAdmin } from '../middleware/auth.ts';
-import { Store, StoreStatus } from '../../src/types/index.ts';
 
 export const adminRouter = Router();
 
-// Todas las rutas de admin requieren SuperAdmin autenticado
+// Todas las rutas de admin requieren autenticación de SUPERADMIN
 adminRouter.use(requireAuth, requireSuperAdmin);
 
-// Métricas globales de la plataforma SaaS
-adminRouter.get('/stats', (_req: Request, res: Response): void => {
-  const totalStores = db.stores.length;
-  const activeStores = db.stores.filter((s) => s.status === 'ACTIVO').length;
-  const suspendedStores = db.stores.filter((s) => s.status === 'SUSPENDIDO').length;
-  const totalOrders = db.orders.length;
-  const totalSales = db.orders
-    .filter((o) => o.status !== 'CANCELADO')
-    .reduce((acc, o) => acc + o.total, 0);
-
-  res.json({
-    success: true,
-    data: {
-      totalStores,
-      activeStores,
-      suspendedStores,
-      totalOrders,
-      totalSales,
-      totalProducts: db.products.length,
-      totalUsers: db.users.length,
-    },
-  });
-});
-
-// Listar todos los comercios
-adminRouter.get('/stores', (_req: Request, res: Response): void => {
-  res.json({
-    success: true,
-    data: db.stores.map((s) => {
-      const storeProducts = db.products.filter((p) => p.storeId === s.id).length;
-      const storeOrders = db.orders.filter((o) => o.storeId === s.id).length;
-      const adminUser = db.users.find((u) => u.storeId === s.id && u.role === 'ADMIN_COMERCIO');
-
-      return {
-        ...s,
-        productsCount: storeProducts,
-        ordersCount: storeOrders,
-        adminEmail: adminUser ? adminUser.email : null,
-      };
-    }),
-  });
-});
-
-// Crear nuevo comercio (Tenant Provisioning)
-adminRouter.post('/stores', (req: Request, res: Response): void => {
-  const { name, slug, email, phone, adminName, adminEmail, primaryColor } = req.body;
-
-  if (!name || !slug || !email || !adminEmail) {
-    res.status(400).json({
-      success: false,
-      error: { code: 'INVALID_INPUT', message: 'Nombre, slug, email y email de administrador son requeridos.' },
-    });
-    return;
-  }
-
-  const cleanSlug = slug.toLowerCase().trim().replace(/[^a-z0-9-]/g, '-');
-  if (db.stores.some((s) => s.slug === cleanSlug)) {
-    res.status(400).json({
-      success: false,
-      error: { code: 'SLUG_ALREADY_EXISTS', message: 'El slug ya se encuentra en uso por otra tienda.' },
-    });
-    return;
-  }
-
-  const storeId = `store-${cleanSlug}`;
-  const newStore: Store = {
-    id: storeId,
-    slug: cleanSlug,
-    name,
-    description: '',
-    logo: '',
-    banner: '',
-    phone: phone || '',
-    email,
-    address: '',
-    schedule: '',
-    primaryColor: primaryColor || '#2563eb',
-    secondaryColor: '#1e293b',
-    status: 'ACTIVO',
-    mercadoPagoConnected: false,
-    settings: {
-      shippingCost: 0,
-      freeShippingMinAmount: 0,
-      minOrderAmount: 0,
-      allowPickup: true,
-      allowDelivery: true,
-      acceptCashOnDelivery: true,
-      acceptBankTransfer: true,
-      bankDetails: {
-        bankName: '',
-        accountHolder: '',
-        accountNumber: '',
-        cbuCvu: '',
-        alias: '',
-      },
-    },
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
-
-  db.stores.push(newStore);
-
-  // Crear usuario administrador del comercio
-  const newUser = {
-    id: `user-admin-${Date.now()}`,
-    email: adminEmail.toLowerCase().trim(),
-    name: adminName || `Admin ${name}`,
-    role: 'ADMIN_COMERCIO' as const,
-    storeId: storeId,
-    createdAt: new Date().toISOString(),
-  };
-
-  db.users.push(newUser);
-
-  // Crear suscripción SaaS inicial con tarifa fija y 0% de comisión
-  const thirtyDaysLater = new Date();
-  thirtyDaysLater.setDate(thirtyDaysLater.getDate() + 30);
-  db.subscriptions.push({
-    id: `sub-${storeId}`,
-    storeId,
-    planName: 'Plan Comercio Pro (Fijo)',
-    amount: 15000,
-    currency: 'ARS',
-    status: 'ACTIVE',
-    interval: 'MONTHLY',
-    commissionRate: 0.0,
-    currentPeriodStart: new Date().toISOString(),
-    currentPeriodEnd: thirtyDaysLater.toISOString(),
-    cancelAtPeriodEnd: false,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  });
-
-  // Registrar auditoría
-  db.auditLogs.push({
-    id: `log-${Date.now()}`,
-    storeId,
-    userId: req.user?.id,
-    action: 'TENANT_PROVISIONED',
-    entity: 'Store',
-    entityId: storeId,
-    details: { name, slug: cleanSlug, adminEmail },
-    createdAt: new Date().toISOString(),
-  });
-
-  res.status(201).json({
-    success: true,
-    data: {
-      store: newStore,
-      adminUser: newUser,
-    },
-  });
-});
-
-// Cambiar estado de comercio (ACTIVO / SUSPENDIDO / PENDIENTE)
-adminRouter.patch('/stores/:storeId/status', (req: Request, res: Response): void => {
-  const { storeId } = req.params;
-  const { status } = req.body;
-
-  const validStatuses: StoreStatus[] = ['PENDIENTE', 'ACTIVO', 'SUSPENDIDO'];
-  if (!validStatuses.includes(status)) {
-    res.status(400).json({
-      success: false,
-      error: { code: 'INVALID_STATUS', message: 'Estado de comercio inválido.' },
-    });
-    return;
-  }
-
-  const storeIndex = db.stores.findIndex((s) => s.id === storeId);
-  if (storeIndex === -1) {
-    res.status(404).json({
-      success: false,
-      error: { code: 'STORE_NOT_FOUND', message: 'Comercio no encontrado.' },
-    });
-    return;
-  }
-
-  const previousStatus = db.stores[storeIndex].status;
-  db.stores[storeIndex].status = status;
-  db.stores[storeIndex].updatedAt = new Date().toISOString();
-
-  // Registrar auditoría
-  db.auditLogs.push({
-    id: `log-${Date.now()}`,
-    storeId,
-    userId: req.user?.id,
-    action: 'STORE_STATUS_CHANGE',
-    entity: 'Store',
-    entityId: storeId,
-    details: { previousStatus, newStatus: status },
-    createdAt: new Date().toISOString(),
-  });
-
-  res.json({
-    success: true,
-    data: db.stores[storeIndex],
-  });
-});
-
-// Listar todas las suscripciones de la plataforma SaaS (SuperAdmin)
-adminRouter.get('/subscriptions', (_req: Request, res: Response): void => {
-  const subscriptionsWithStore = db.subscriptions.map((sub) => {
-    const store = db.stores.find((s) => s.id === sub.storeId);
-    return {
-      ...sub,
-      storeName: store ? store.name : sub.storeId,
-      storeSlug: store ? store.slug : '',
-      storeStatus: store ? store.status : 'DESCONOCIDO',
-    };
-  });
-
-  const mrr = db.subscriptions
-    .filter((s) => s.status === 'ACTIVE')
-    .reduce((sum, s) => sum + s.amount, 0);
-
-  res.json({
-    success: true,
-    data: {
-      subscriptions: subscriptionsWithStore,
-      mrr,
-      totalSubscribers: db.subscriptions.filter((s) => s.status === 'ACTIVE').length,
-    },
-  });
-});
-
-// Actualizar tarifa o estado de suscripción de un comercio
-adminRouter.patch('/subscriptions/:storeId', (req: Request, res: Response): void => {
-  const { storeId } = req.params;
-  const { amount, planName, status } = req.body;
-
-  let sub = db.subscriptions.find((s) => s.storeId === storeId);
-  if (!sub) {
-    res.status(404).json({ success: false, error: { code: 'SUB_NOT_FOUND', message: 'Suscripción no encontrada.' } });
-    return;
-  }
-
-  if (amount !== undefined) sub.amount = Number(amount);
-  if (planName) sub.planName = planName;
-  if (status) sub.status = status;
-  sub.updatedAt = new Date().toISOString();
-
-  db.auditLogs.push({
-    id: `log-${Date.now()}`,
-    storeId,
-    userId: req.user?.id,
-    action: 'SUBSCRIPTION_UPDATE',
-    entity: 'Subscription',
-    entityId: sub.id,
-    details: { amount, planName, status },
-    createdAt: new Date().toISOString(),
-  });
-
-  res.json({ success: true, data: sub });
-});
-
-// Listar registro de auditoría de la plataforma
-adminRouter.get('/audit-logs', (_req: Request, res: Response): void => {
-  res.json({
-    success: true,
-    data: db.auditLogs.slice(-100).reverse(), // Últimos 100 eventos
-  });
-});
-
-// Ejecutar suite completa de tests automatizados (25 pruebas)
-adminRouter.post('/run-tests', async (_req: Request, res: Response): Promise<void> => {
+// Obtener estadísticas métricas globales de la plataforma SaaS
+adminRouter.get('/stats', async (_req: Request, res: Response): Promise<void> => {
   try {
-    const { runAllTests } = await import('../tests/suite.ts');
-    const summary = await runAllTests();
+    const stores = await db.listStores();
+    const users = await db.listUsers();
+    const subscriptions = await db.listSubscriptions();
+    const auditLogs = await db.listAuditLogs(10);
+
+    const activeStores = stores.filter((s) => s.status === 'ACTIVO').length;
+    const suspendedStores = stores.filter((s) => s.status === 'SUSPENDIDO').length;
+
+    let totalGlobalSales = 0;
+    let totalGlobalOrders = 0;
+
+    for (const store of stores) {
+      const storeOrders = await db.findOrdersByStore(store.id);
+      totalGlobalOrders += storeOrders.length;
+      totalGlobalSales += storeOrders
+        .filter((o) => o.status !== 'CANCELADO')
+        .reduce((sum, o) => sum + Number(o.total), 0);
+    }
+
     res.json({
       success: true,
-      data: summary,
+      data: {
+        totalStores: stores.length,
+        activeStores,
+        suspendedStores,
+        totalUsers: users.length,
+        totalOrders: totalGlobalOrders,
+        totalSales: totalGlobalSales,
+        subscriptionsCount: subscriptions.length,
+        recentAuditsCount: auditLogs.length,
+      },
     });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Error ejecutando tests';
-    res.status(500).json({ success: false, error: { code: 'TEST_RUNNER_ERROR', message } });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Error obteniendo estadísticas globales';
+    res.status(500).json({ success: false, error: { code: 'ADMIN_STATS_ERROR', message } });
   }
 });
 
+// Listar todas las tiendas de la plataforma
+adminRouter.get('/stores', async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const stores = await db.listStores();
+    res.json({
+      success: true,
+      data: stores.map((s) => ({
+        ...s,
+        productsCount: s._count?.products || 0,
+        ordersCount: s._count?.orders || 0,
+        mercadoPagoConnected: Boolean(s.mercadoPago?.active),
+      })),
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Error listando tiendas';
+    res.status(500).json({ success: false, error: { code: 'ADMIN_STORES_ERROR', message } });
+  }
+});
+
+// Crear nuevo comercio / tenant en la plataforma
+adminRouter.post('/stores', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { slug, name, description, email, phone, address, primaryColor, secondaryColor, settings } = req.body;
+
+    if (!slug || !name || !email) {
+      res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_INPUT', message: 'Slug, nombre y email del comercio son obligatorios.' },
+      });
+      return;
+    }
+
+    const existing = await db.findStoreBySlug(slug);
+    if (existing) {
+      res.status(400).json({
+        success: false,
+        error: { code: 'SLUG_ALREADY_EXISTS', message: 'El identificador (slug) ya está en uso por otro comercio.' },
+      });
+      return;
+    }
+
+    const newStore = await db.createStore({
+      slug,
+      name,
+      description,
+      email,
+      phone,
+      address,
+      primaryColor,
+      secondaryColor,
+      settings,
+    });
+
+    await db.logAudit({
+      userId: req.user?.id,
+      storeId: newStore.id,
+      action: 'STORE_CREATE_ADMIN',
+      entity: 'Store',
+      entityId: newStore.id,
+      details: { name: newStore.name, slug: newStore.slug },
+      ipAddress: req.ip,
+    });
+
+    res.status(201).json({ success: true, data: newStore });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Error creando comercio';
+    res.status(500).json({ success: false, error: { code: 'STORE_CREATE_ERROR', message } });
+  }
+});
+
+// Actualizar estado de la tienda (Activar / Suspender)
+adminRouter.patch('/stores/:storeId/status', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { storeId } = req.params;
+    const { status } = req.body;
+
+    if (status !== 'ACTIVO' && status !== 'SUSPENDIDO') {
+      res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_STATUS', message: 'Estado inválido. Debe ser ACTIVO o SUSPENDIDO.' },
+      });
+      return;
+    }
+
+    const updated = await db.updateStore(storeId, { status });
+
+    await db.logAudit({
+      userId: req.user?.id,
+      storeId,
+      action: 'STORE_STATUS_CHANGE',
+      entity: 'Store',
+      entityId: storeId,
+      details: { newStatus: status },
+      ipAddress: req.ip,
+    });
+
+    res.json({ success: true, data: updated });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Error actualizando estado de tienda';
+    res.status(404).json({ success: false, error: { code: 'STORE_NOT_FOUND', message } });
+  }
+});
+
+// Listar suscripciones SaaS de todos los comercios
+adminRouter.get('/subscriptions', async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const subs = await db.listSubscriptions();
+    res.json({ success: true, data: subs });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Error listando suscripciones';
+    res.status(500).json({ success: false, error: { code: 'SUBS_LIST_ERROR', message } });
+  }
+});
+
+// Actualizar suscripción SaaS de un comercio
+adminRouter.put('/subscriptions/:storeId', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { storeId } = req.params;
+    const { planName, amount, status } = req.body;
+
+    const updated = await db.updateSubscription(storeId, {
+      planName,
+      amount: amount !== undefined ? Number(amount) : undefined,
+      status,
+    });
+
+    await db.logAudit({
+      userId: req.user?.id,
+      storeId,
+      action: 'SUBSCRIPTION_UPDATE',
+      entity: 'Subscription',
+      entityId: storeId,
+      details: { planName, amount, status },
+      ipAddress: req.ip,
+    });
+
+    res.json({ success: true, data: updated });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Error actualizando suscripción';
+    res.status(500).json({ success: false, error: { code: 'SUBS_UPDATE_ERROR', message } });
+  }
+});
+
+// Listar registros de auditoría del sistema
+adminRouter.get('/audit-logs', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : 100;
+    const logs = await db.listAuditLogs(limit);
+    res.json({ success: true, data: logs });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Error listando auditoría';
+    res.status(500).json({ success: false, error: { code: 'AUDIT_LIST_ERROR', message } });
+  }
+});
+
+// Listar todos los usuarios de la plataforma
+adminRouter.get('/users', async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const users = await db.listUsers();
+    res.json({ success: true, data: users });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Error listando usuarios';
+    res.status(500).json({ success: false, error: { code: 'USERS_LIST_ERROR', message } });
+  }
+});

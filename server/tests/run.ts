@@ -2,15 +2,15 @@
  * Test Runner CLI Execution
  */
 
-import { runAllTests } from './suite.ts';
+import { runCompleteTestSuite } from './suite.ts';
 
 async function main() {
   console.log('\n=============================================================');
-  console.log('  PAGINAS WEB VENTAS ONLINE - AUTOMATED TEST SUITE (25 TESTS)');
+  console.log('  PAGINAS WEB VENTAS ONLINE - AUTOMATED TEST SUITE (36 TESTS)');
   console.log('=============================================================\n');
 
   try {
-    const summary = await runAllTests();
+    const summary = await runCompleteTestSuite();
 
     for (const r of summary.results) {
       const statusIcon = r.passed ? '✅ PASSED' : '❌ FAILED';
