@@ -8,7 +8,7 @@ import { db } from '../db/index.ts';
 import { requireAuth } from '../middleware/auth.ts';
 import { enforceTenantIsolation } from '../middleware/tenant.ts';
 import { mercadoPagoService } from '../payments/mercadopago.service.ts';
-import { Payment, PaymentStatus, OrderStatus } from '../../src/types/index.ts';
+import { PaymentStatus } from '../../src/types/index.ts';
 
 export const paymentRouter = Router();
 
@@ -34,7 +34,7 @@ paymentRouter.get('/mercadopago/status/:storeId', requireAuth, enforceTenantIsol
   });
 });
 
-// Obtener URL para conectar la cuenta de Mercado Pago del comercio vía OAuth
+// Obtener URL para conectar la cuenta de Mercado Pago del comercio vía OAuth (con CSRF protection)
 paymentRouter.get('/mercadopago/connect-url/:storeId', requireAuth, enforceTenantIsolation, (req: Request, res: Response): void => {
   const { storeId } = req.params;
 
@@ -58,27 +58,33 @@ paymentRouter.get('/mercadopago/connect-url/:storeId', requireAuth, enforceTenan
   }
 });
 
-// Callback OAuth de Mercado Pago (Recibe 'code' y 'state' con storeId)
+// Callback OAuth de Mercado Pago (Recibe 'code' y 'state' firmado)
 paymentRouter.get('/mercadopago/oauth/callback', async (req: Request, res: Response): Promise<void> => {
-  const { code, state: storeId } = req.query;
+  const { code, state } = req.query;
 
-  if (!code || !storeId) {
-    res.status(400).send('Parámetros de OAuth inválidos.');
+  if (!code || !state) {
+    res.status(400).send('Parámetros de OAuth inválidos o incompletos.');
+    return;
+  }
+
+  // Validar y extraer storeId del state firmado
+  const verifiedStoreId = mercadoPagoService.verifyOAuthState(String(state));
+  if (!verifiedStoreId) {
+    res.status(400).send('El parámetro state de OAuth es inválido, manipulado o ha expirado.');
     return;
   }
 
   try {
     const tokenData = await mercadoPagoService.exchangeOAuthCode(String(code));
-    const cleanStoreId = String(storeId);
 
-    // Encriptar tokens antes de persistirlos en la base de datos
+    // Encriptar tokens con AES-256-GCM antes de persistirlos en la base de datos
     const encryptedAccessToken = mercadoPagoService.encrypt(tokenData.access_token);
     const encryptedRefreshToken = tokenData.refresh_token ? mercadoPagoService.encrypt(tokenData.refresh_token) : undefined;
 
-    const existingIndex = db.mpConnections.findIndex((c) => c.storeId === cleanStoreId);
+    const existingIndex = db.mpConnections.findIndex((c) => c.storeId === verifiedStoreId);
     const connection = {
       id: `mp-conn-${Date.now()}`,
-      storeId: cleanStoreId,
+      storeId: verifiedStoreId,
       mpUserId: String(tokenData.user_id),
       accessTokenEncrypted: encryptedAccessToken,
       refreshTokenEncrypted: encryptedRefreshToken,
@@ -95,10 +101,21 @@ paymentRouter.get('/mercadopago/oauth/callback', async (req: Request, res: Respo
     }
 
     // Marcar tienda con Mercado Pago conectado
-    const store = db.stores.find((s) => s.id === cleanStoreId);
+    const store = db.stores.find((s) => s.id === verifiedStoreId);
     if (store) {
       store.mercadoPagoConnected = true;
     }
+
+    // Registrar auditoría
+    db.auditLogs.push({
+      id: `log-${Date.now()}`,
+      storeId: verifiedStoreId,
+      action: 'MP_OAUTH_CONNECTED',
+      entity: 'MercadoPagoConnection',
+      entityId: connection.id,
+      details: { mpUserId: connection.mpUserId },
+      createdAt: new Date().toISOString(),
+    });
 
     res.send(`
       <!DOCTYPE html>
@@ -117,7 +134,7 @@ paymentRouter.get('/mercadopago/oauth/callback', async (req: Request, res: Respo
           <script>
             try {
               if (window.opener) {
-                window.opener.postMessage({ type: 'MP_CONNECTED', storeId: '${cleanStoreId}' }, '*');
+                window.opener.postMessage({ type: 'MP_CONNECTED', storeId: '${verifiedStoreId}' }, '*');
               }
             } catch(e) {}
             setTimeout(() => window.close(), 2500);
@@ -162,6 +179,17 @@ paymentRouter.post('/mercadopago/dev-connect/:storeId', requireAuth, enforceTena
     store.mercadoPagoConnected = true;
   }
 
+  db.auditLogs.push({
+    id: `log-${Date.now()}`,
+    storeId,
+    userId: req.user?.id,
+    action: 'MP_SANDBOX_CONNECTED',
+    entity: 'MercadoPagoConnection',
+    entityId: connection.id,
+    details: { mpUserId: connection.mpUserId },
+    createdAt: new Date().toISOString(),
+  });
+
   res.json({
     success: true,
     data: {
@@ -191,6 +219,16 @@ paymentRouter.post('/mercadopago/disconnect/:storeId', requireAuth, enforceTenan
     store.mercadoPagoConnected = false;
   }
 
+  db.auditLogs.push({
+    id: `log-${Date.now()}`,
+    storeId,
+    userId: req.user?.id,
+    action: 'MP_DISCONNECTED',
+    entity: 'MercadoPagoConnection',
+    entityId: `mp-conn-${storeId}`,
+    createdAt: new Date().toISOString(),
+  });
+
   res.json({
     success: true,
     data: { message: 'Mercado Pago ha sido desconectado de este comercio.' },
@@ -206,7 +244,7 @@ paymentRouter.post('/mercadopago/create-preference/:storeId', async (req: Reques
 
   const order = db.orders.find((o) => o.id === orderId && o.storeId === storeId);
   if (!order) {
-    res.status(404).json({ success: false, error: { code: 'ORDER_NOT_FOUND', message: 'Orden no encontrada.' } });
+    res.status(404).json({ success: false, error: { code: 'ORDER_NOT_FOUND', message: 'Orden no encontrada en este comercio.' } });
     return;
   }
 
@@ -250,9 +288,9 @@ paymentRouter.post('/mercadopago/create-preference/:storeId', async (req: Reques
     });
 
     // Registrar intento de pago pendiente (Idempotente)
-    const existingPayment = db.payments.find((p) => p.orderId === order.id);
+    let existingPayment = db.payments.find((p) => p.orderId === order.id);
     if (!existingPayment) {
-      db.payments.push({
+      existingPayment = {
         id: `pay-${Date.now()}`,
         orderId: order.id,
         storeId,
@@ -263,7 +301,11 @@ paymentRouter.post('/mercadopago/create-preference/:storeId', async (req: Reques
         currency: 'ARS',
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-      });
+      };
+      db.payments.push(existingPayment);
+    } else {
+      existingPayment.externalId = preference.preferenceId;
+      existingPayment.updatedAt = new Date().toISOString();
     }
 
     res.json({
@@ -284,17 +326,19 @@ paymentRouter.post('/mercadopago/webhook', async (req: Request, res: Response): 
   const xRequestId = req.headers['x-request-id'] as string | undefined;
   const { type, data, action } = req.body;
 
-  const eventId = data?.id ? String(data.id) : `event-${Date.now()}`;
+  // Extraer dataId según la estructura enviada por Mercado Pago
+  const dataId = data?.id ? String(data.id) : (req.query['data.id'] ? String(req.query['data.id']) : String(req.body.id || ''));
+  const eventId = dataId || `event-${Date.now()}`;
 
   // 1. Verificación de firma criptográfica
-  const isValidSignature = mercadoPagoService.verifyWebhookSignature(xSignature, xRequestId, eventId);
+  const isValidSignature = mercadoPagoService.verifyWebhookSignature(xSignature, xRequestId, dataId);
   if (!isValidSignature) {
     console.warn('[Mercado Pago Webhook] Firma inválida rechazada');
     res.status(401).json({ error: 'INVALID_SIGNATURE' });
     return;
   }
 
-  // 2. Control de Idempotencia: Si el evento ya fue procesado, respondemos 200 OK inmediatamente
+  // 2. Control de Idempotencia: Si el evento ya fue procesado, respondemos 200 OK inmediatamente sin duplicar acciones
   const existingEvent = db.webhookEvents.find((e) => e.eventId === eventId);
   if (existingEvent) {
     res.status(200).json({ received: true, idempotent: true });
@@ -315,10 +359,10 @@ paymentRouter.post('/mercadopago/webhook', async (req: Request, res: Response): 
 
   // 4. Procesar pagos
   if (type === 'payment' || action === 'payment.created' || action === 'payment.updated') {
-    const paymentId = String(data?.id);
+    const paymentId = dataId;
     
-    // Buscar si existe un pago registrado con este externalId o consultar órdenes
-    const paymentRecord = db.payments.find((p) => p.externalId === paymentId);
+    // Buscar si existe un pago registrado con este externalId
+    const paymentRecord = db.payments.find((p) => p.externalId === paymentId || p.id === paymentId);
     if (paymentRecord) {
       const storeConnection = db.mpConnections.find((c) => c.storeId === paymentRecord.storeId && c.active);
       if (storeConnection && storeConnection.accessTokenEncrypted) {
@@ -330,11 +374,22 @@ paymentRouter.post('/mercadopago/webhook', async (req: Request, res: Response): 
           // Sincronizar estado del pedido de forma segura
           const order = db.orders.find((o) => o.id === paymentRecord.orderId);
           if (order) {
+            const previousStatus = order.status;
             order.paymentStatus = mpPayment.status;
+
             if (mpPayment.status === 'APPROVED') {
               order.status = 'CONFIRMADO';
             } else if (mpPayment.status === 'REJECTED' || mpPayment.status === 'CANCELLED') {
               order.status = 'CANCELADO';
+              // Restaurar stock si se cancela o rechaza
+              if (previousStatus !== 'CANCELADO') {
+                for (const item of order.items) {
+                  const product = db.products.find((p) => p.id === item.productId && p.storeId === order.storeId);
+                  if (product) {
+                    product.stock += item.quantity;
+                  }
+                }
+              }
             }
             order.updatedAt = new Date().toISOString();
           }
@@ -362,6 +417,8 @@ paymentRouter.post('/mercadopago/simulate-payment-webhook', (req: Request, res: 
     res.status(404).json({ success: false, error: { code: 'ORDER_NOT_FOUND', message: 'Orden no encontrada.' } });
     return;
   }
+
+  const previousStatus = order.status;
 
   // Actualizar o crear registro de pago
   let payment = db.payments.find((p) => p.orderId === orderId);
@@ -393,6 +450,15 @@ paymentRouter.post('/mercadopago/simulate-payment-webhook', (req: Request, res: 
     order.status = 'CONFIRMADO';
   } else if (targetStatus === 'REJECTED' || targetStatus === 'CANCELLED') {
     order.status = 'CANCELADO';
+    // Restaurar stock si se cancela o rechaza
+    if (previousStatus !== 'CANCELADO') {
+      for (const item of order.items) {
+        const product = db.products.find((p) => p.id === item.productId && p.storeId === order.storeId);
+        if (product) {
+          product.stock += item.quantity;
+        }
+      }
+    }
   }
   order.updatedAt = new Date().toISOString();
 

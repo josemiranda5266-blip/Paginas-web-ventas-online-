@@ -14,7 +14,6 @@ import {
   Subscription,
   DeliveryMethod,
   PaymentProvider,
-  StoreSettings,
 } from '../types/index.ts';
 
 const API_BASE = '/api';
@@ -51,10 +50,12 @@ class ApiService {
 
   public setToken(token: string | null): void {
     this.token = token;
-    if (token) {
-      localStorage.setItem('saas_auth_token', token);
-    } else {
-      localStorage.removeItem('saas_auth_token');
+    if (typeof window !== 'undefined') {
+      if (token) {
+        localStorage.setItem('saas_auth_token', token);
+      } else {
+        localStorage.removeItem('saas_auth_token');
+      }
     }
   }
 
@@ -113,6 +114,10 @@ class ApiService {
     return this.request<Store[]>('/stores');
   }
 
+  public async getStoreById(storeId: string): Promise<Store> {
+    return this.request<Store>(`/stores/${storeId}`);
+  }
+
   public async getStoreBySlug(slug: string): Promise<{ store: Store; categories: Category[]; products: Product[] }> {
     return this.request<{ store: Store; categories: Category[]; products: Product[] }>(`/stores/by-slug/${slug}`);
   }
@@ -144,6 +149,10 @@ class ApiService {
   // ==========================================
   public async getProductsByStore(storeId: string): Promise<Product[]> {
     return this.request<Product[]>(`/catalog/products/${storeId}`);
+  }
+
+  public async getProductById(storeId: string, productId: string): Promise<Product> {
+    return this.request<Product>(`/catalog/products/${storeId}/${productId}`);
   }
 
   public async createProduct(storeId: string, product: Partial<Product>): Promise<Product> {
@@ -189,6 +198,10 @@ class ApiService {
 
   public async getStoreOrders(storeId: string): Promise<Order[]> {
     return this.request<Order[]>(`/orders/${storeId}`);
+  }
+
+  public async getOrderById(storeId: string, orderId: string): Promise<Order> {
+    return this.request<Order>(`/orders/${storeId}/${orderId}`);
   }
 
   public async updateOrderStatus(storeId: string, orderId: string, status: OrderStatus): Promise<Order> {
@@ -282,6 +295,33 @@ class ApiService {
     totalSubscribers: number;
   }> {
     return this.request('/admin/subscriptions');
+  }
+
+  public async updateSubscription(storeId: string, data: { amount?: number; planName?: string; status?: string }): Promise<Subscription> {
+    return this.request(`/admin/subscriptions/${storeId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    });
+  }
+
+  public async getAuditLogs(): Promise<Array<Record<string, unknown>>> {
+    return this.request('/admin/audit-logs');
+  }
+
+  public async runAutomatedTests(): Promise<{
+    total: number;
+    passed: number;
+    failed: number;
+    results: Array<{
+      id: number;
+      name: string;
+      category: string;
+      passed: boolean;
+      error?: string;
+      durationMs: number;
+    }>;
+  }> {
+    return this.request('/admin/run-tests', { method: 'POST' });
   }
 
   public async createStore(payload: {

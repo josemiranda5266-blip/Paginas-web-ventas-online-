@@ -1,18 +1,24 @@
 /**
  * Mercado Pago Multi-Tenant Payment Adapter & Service
  * 
- * Arquitectura:
+ * Arquitectura y Principios:
  * 1. OAuth por comercio (Cada comercio autoriza SU propia cuenta).
  * 2. Cero comisiones de venta descontadas por nuestra app (100% de la venta va a la cuenta del comercio).
- * 3. Encriptación AES-256 de access tokens y refresh tokens.
- * 4. Creación de preferencias de pago con el Access Token del comercio.
+ * 3. Encriptación AES-256-GCM de access tokens y refresh tokens en almacenamiento.
+ * 4. Creación de checkout preferences con el Access Token del comercio.
  * 5. Verificación criptográfica de firma de Webhooks (HMAC-SHA256).
- * 6. Normalización e idempotencia de eventos de pago.
+ * 6. Normalización e idempotencia estricta de eventos de pago.
  */
 
 import { PaymentStatus } from '../../src/types/index.ts';
 import { CreatePreferenceOptions, MercadoPagoOAuthTokenResponse, PaymentWebhookResult } from './types.ts';
-import { encryptToken, decryptToken, verifyMercadoPagoWebhookSignature } from '../utils/crypto.ts';
+import {
+  encryptToken,
+  decryptToken,
+  generateOAuthState,
+  verifyOAuthState,
+  verifyMercadoPagoWebhookSignature,
+} from '../utils/crypto.ts';
 
 export class MercadoPagoService {
   private clientId: string;
@@ -36,21 +42,29 @@ export class MercadoPagoService {
 
   /**
    * Genera la URL de autorización OAuth de Mercado Pago para que el comercio conecte su cuenta.
-   * Se incluye el `storeId` en el parámetro `state` para asociar la conexión de forma aislada.
+   * Se incluye un `state` firmado criptográficamente para asociar la conexión de forma aislada y prevenir CSRF.
    */
   public getOAuthAuthorizationUrl(storeId: string): string {
     if (!this.clientId) {
       throw new Error('MP_APP_CLIENT_ID no configurado en variables de entorno');
     }
+    const signedState = generateOAuthState(storeId);
     const baseUrl = 'https://auth.mercadopago.com/authorization';
     const params = new URLSearchParams({
       client_id: this.clientId,
       response_type: 'code',
       platform_id: 'mp',
-      state: storeId,
+      state: signedState,
       redirect_uri: this.redirectUri,
     });
     return `${baseUrl}?${params.toString()}`;
+  }
+
+  /**
+   * Valida el parámetro state retornado por el callback de OAuth.
+   */
+  public verifyOAuthState(state: string): string | null {
+    return verifyOAuthState(state);
   }
 
   /**
@@ -116,6 +130,7 @@ export class MercadoPagoService {
 
   /**
    * Crea una preferencia de pago en la cuenta del comercio usando SU propio Access Token.
+   * Cero marketplace_fee (100% de los fondos van directo al comercio).
    */
   public async createPreference(
     encryptedStoreAccessToken: string,
@@ -158,6 +173,7 @@ export class MercadoPagoService {
       notification_url: options.notificationUrl,
       external_reference: options.orderId,
       statement_descriptor: `Tienda ${options.storeId}`,
+      marketplace_fee: 0, // 0% de comisión de plataforma en ventas
     };
 
     const response = await fetch('https://api.mercadopago.com/checkout/preferences', {
@@ -196,7 +212,7 @@ export class MercadoPagoService {
     }
 
     // Si es un ID de prueba simulado en desarrollo
-    if (paymentId.startsWith('sim-') || storeAccessToken.startsWith('TEST_MOCK_TOKEN_')) {
+    if (paymentId.startsWith('sim-') || storeAccessToken.startsWith('SANDBOX_DEMO_') || storeAccessToken.startsWith('TEST_MOCK_TOKEN_')) {
       return {
         paymentId,
         status: 'APPROVED',
@@ -244,7 +260,8 @@ export class MercadoPagoService {
     xRequestId: string | undefined,
     dataId: string
   ): boolean {
-    return verifyMercadoPagoWebhookSignature(xSignature, xRequestId, dataId, this.webhookSecret);
+    const secret = process.env.MP_WEBHOOK_SECRET || this.webhookSecret;
+    return verifyMercadoPagoWebhookSignature(xSignature, xRequestId, dataId, secret);
   }
 
   /**

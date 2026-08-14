@@ -1,6 +1,6 @@
 /**
  * SuperAdmin Routes
- * Gestión global de comercios, suspensión/activación y métricas de plataforma.
+ * Gestión global de comercios, suspensión/activación, planes de suscripción y auditoría.
  */
 
 import { Router, Request, Response } from 'express';
@@ -10,10 +10,10 @@ import { Store, StoreStatus } from '../../src/types/index.ts';
 
 export const adminRouter = Router();
 
-// Todas las rutas de admin requieren SuperAdmin
+// Todas las rutas de admin requieren SuperAdmin autenticado
 adminRouter.use(requireAuth, requireSuperAdmin);
 
-// Métricas globales de la plataforma
+// Métricas globales de la plataforma SaaS
 adminRouter.get('/stats', (_req: Request, res: Response): void => {
   const totalStores = db.stores.length;
   const activeStores = db.stores.filter((s) => s.status === 'ACTIVO').length;
@@ -127,6 +127,37 @@ adminRouter.post('/stores', (req: Request, res: Response): void => {
 
   db.users.push(newUser);
 
+  // Crear suscripción SaaS inicial con tarifa fija y 0% de comisión
+  const thirtyDaysLater = new Date();
+  thirtyDaysLater.setDate(thirtyDaysLater.getDate() + 30);
+  db.subscriptions.push({
+    id: `sub-${storeId}`,
+    storeId,
+    planName: 'Plan Comercio Pro (Fijo)',
+    amount: 15000,
+    currency: 'ARS',
+    status: 'ACTIVE',
+    interval: 'MONTHLY',
+    commissionRate: 0.0,
+    currentPeriodStart: new Date().toISOString(),
+    currentPeriodEnd: thirtyDaysLater.toISOString(),
+    cancelAtPeriodEnd: false,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  // Registrar auditoría
+  db.auditLogs.push({
+    id: `log-${Date.now()}`,
+    storeId,
+    userId: req.user?.id,
+    action: 'TENANT_PROVISIONED',
+    entity: 'Store',
+    entityId: storeId,
+    details: { name, slug: cleanSlug, adminEmail },
+    createdAt: new Date().toISOString(),
+  });
+
   res.status(201).json({
     success: true,
     data: {
@@ -159,8 +190,21 @@ adminRouter.patch('/stores/:storeId/status', (req: Request, res: Response): void
     return;
   }
 
+  const previousStatus = db.stores[storeIndex].status;
   db.stores[storeIndex].status = status;
   db.stores[storeIndex].updatedAt = new Date().toISOString();
+
+  // Registrar auditoría
+  db.auditLogs.push({
+    id: `log-${Date.now()}`,
+    storeId,
+    userId: req.user?.id,
+    action: 'STORE_STATUS_CHANGE',
+    entity: 'Store',
+    entityId: storeId,
+    details: { previousStatus, newStatus: status },
+    createdAt: new Date().toISOString(),
+  });
 
   res.json({
     success: true,
@@ -192,5 +236,58 @@ adminRouter.get('/subscriptions', (_req: Request, res: Response): void => {
       totalSubscribers: db.subscriptions.filter((s) => s.status === 'ACTIVE').length,
     },
   });
+});
+
+// Actualizar tarifa o estado de suscripción de un comercio
+adminRouter.patch('/subscriptions/:storeId', (req: Request, res: Response): void => {
+  const { storeId } = req.params;
+  const { amount, planName, status } = req.body;
+
+  let sub = db.subscriptions.find((s) => s.storeId === storeId);
+  if (!sub) {
+    res.status(404).json({ success: false, error: { code: 'SUB_NOT_FOUND', message: 'Suscripción no encontrada.' } });
+    return;
+  }
+
+  if (amount !== undefined) sub.amount = Number(amount);
+  if (planName) sub.planName = planName;
+  if (status) sub.status = status;
+  sub.updatedAt = new Date().toISOString();
+
+  db.auditLogs.push({
+    id: `log-${Date.now()}`,
+    storeId,
+    userId: req.user?.id,
+    action: 'SUBSCRIPTION_UPDATE',
+    entity: 'Subscription',
+    entityId: sub.id,
+    details: { amount, planName, status },
+    createdAt: new Date().toISOString(),
+  });
+
+  res.json({ success: true, data: sub });
+});
+
+// Listar registro de auditoría de la plataforma
+adminRouter.get('/audit-logs', (_req: Request, res: Response): void => {
+  res.json({
+    success: true,
+    data: db.auditLogs.slice(-100).reverse(), // Últimos 100 eventos
+  });
+});
+
+// Ejecutar suite completa de tests automatizados (25 pruebas)
+adminRouter.post('/run-tests', async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const { runAllTests } = await import('../tests/suite.ts');
+    const summary = await runAllTests();
+    res.json({
+      success: true,
+      data: summary,
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Error ejecutando tests';
+    res.status(500).json({ success: false, error: { code: 'TEST_RUNNER_ERROR', message } });
+  }
 });
 

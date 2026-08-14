@@ -5,6 +5,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { UserRole } from '../../src/types/index.ts';
 import { db } from '../db/index.ts';
+import { verifyJwtToken } from '../utils/crypto.ts';
 
 // Extender tipos de Request de Express para incluir contexto del usuario autenticado
 export interface AuthenticatedUser {
@@ -24,20 +25,37 @@ declare global {
   }
 }
 
-export function authMiddleware(req: Request, res: Response, next: NextFunction): void {
+export function authMiddleware(req: Request, _res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    // Si no hay token, el endpoint puede ser público a menos que requireAuth lo exija
     next();
     return;
   }
 
-  const token = authHeader.split(' ')[1];
+  const token = authHeader.split(' ')[1]?.trim();
 
-  // En producción se verifica jwt.verify(token, JWT_SECRET).
-  // Para la arquitectura inicial con sesión de desarrollo:
-  const user = db.users.find((u) => u.id === token || u.email === token || token.includes(u.id));
+  if (!token) {
+    next();
+    return;
+  }
+
+  // 1. Intento de verificación con JWT criptográfico
+  const jwtPayload = verifyJwtToken<AuthenticatedUser>(token);
+  if (jwtPayload && jwtPayload.id && jwtPayload.role) {
+    req.user = {
+      id: String(jwtPayload.id),
+      email: String(jwtPayload.email || ''),
+      name: String(jwtPayload.name || ''),
+      role: jwtPayload.role as UserRole,
+      storeId: jwtPayload.storeId ? String(jwtPayload.storeId) : undefined,
+    };
+    next();
+    return;
+  }
+
+  // 2. Búsqueda directa en base de datos (compatibilidad con IDs o tokens de prueba)
+  const user = db.users.find((u) => u.id === token || u.email === token);
 
   if (user) {
     req.user = {

@@ -4,6 +4,7 @@
 
 import { Router, Request, Response } from 'express';
 import { db } from '../db/index.ts';
+import { signJwtToken } from '../utils/crypto.ts';
 
 export const authRouter = Router();
 
@@ -24,7 +25,7 @@ authRouter.post('/login', (req: Request, res: Response): void => {
   if (!user) {
     res.status(401).json({
       success: false,
-      error: { code: 'INVALID_CREDENTIALS', message: 'Usuario no encontrado.' },
+      error: { code: 'INVALID_CREDENTIALS', message: 'Credenciales inválidas. Usuario no encontrado.' },
     });
     return;
   }
@@ -33,6 +34,27 @@ authRouter.post('/login', (req: Request, res: Response): void => {
   if (user.storeId) {
     store = db.stores.find((s) => s.id === user.storeId);
   }
+
+  // Generar JWT firmado con payload de sesión
+  const token = signJwtToken({
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    role: user.role,
+    storeId: user.storeId,
+  });
+
+  // Registrar auditoría de inicio de sesión
+  db.auditLogs.push({
+    id: `log-${Date.now()}`,
+    storeId: user.storeId,
+    userId: user.id,
+    action: 'USER_LOGIN',
+    entity: 'User',
+    entityId: user.id,
+    details: { email: user.email, role: user.role },
+    createdAt: new Date().toISOString(),
+  });
 
   res.json({
     success: true,
@@ -45,7 +67,7 @@ authRouter.post('/login', (req: Request, res: Response): void => {
         storeId: user.storeId,
         createdAt: user.createdAt,
       },
-      token: user.id, // Token simplificado de sesión para demo
+      token,
       store: store,
     },
   });
@@ -56,7 +78,7 @@ authRouter.get('/me', (req: Request, res: Response): void => {
   if (!req.user) {
     res.status(401).json({
       success: false,
-      error: { code: 'UNAUTHORIZED', message: 'No hay sesión activa.' },
+      error: { code: 'UNAUTHORIZED', message: 'No hay sesión activa o el token es inválido.' },
     });
     return;
   }

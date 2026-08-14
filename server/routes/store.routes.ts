@@ -9,7 +9,7 @@ import { enforceTenantIsolation } from '../middleware/tenant.ts';
 
 export const storeRouter = Router();
 
-// Obtener listado de todas las tiendas activas (público o directorio)
+// Obtener listado de todas las tiendas activas (directorio público)
 storeRouter.get('/', (_req: Request, res: Response): void => {
   res.json({
     success: true,
@@ -69,6 +69,25 @@ storeRouter.get('/by-slug/:slug', (req: Request, res: Response): void => {
   });
 });
 
+// Obtener datos de la tienda por storeId (Admin del comercio o SuperAdmin)
+storeRouter.get('/:storeId', requireAuth, enforceTenantIsolation, (req: Request, res: Response): void => {
+  const { storeId } = req.params;
+  const store = db.stores.find((s) => s.id === storeId);
+
+  if (!store) {
+    res.status(404).json({
+      success: false,
+      error: { code: 'STORE_NOT_FOUND', message: 'Comercio no encontrado.' },
+    });
+    return;
+  }
+
+  res.json({
+    success: true,
+    data: store,
+  });
+});
+
 // Actualizar configuración de la tienda (Admin del comercio o SuperAdmin)
 storeRouter.put('/:storeId/settings', requireAuth, enforceTenantIsolation, (req: Request, res: Response): void => {
   const { storeId } = req.params;
@@ -101,6 +120,18 @@ storeRouter.put('/:storeId/settings', requireAuth, enforceTenantIsolation, (req:
     },
     updatedAt: new Date().toISOString(),
   };
+
+  // Registrar auditoría
+  db.auditLogs.push({
+    id: `log-${Date.now()}`,
+    storeId,
+    userId: req.user?.id,
+    action: 'STORE_SETTINGS_UPDATE',
+    entity: 'Store',
+    entityId: storeId,
+    details: { updatedFields: Object.keys(req.body) },
+    createdAt: new Date().toISOString(),
+  });
 
   res.json({
     success: true,
@@ -167,4 +198,3 @@ storeRouter.get('/:storeId/stats', requireAuth, enforceTenantIsolation, (req: Re
     },
   });
 });
-

@@ -4,7 +4,8 @@
  * Garantiza que:
  * 1. Cada petición identifique el tenant (storeId o slug).
  * 2. Un usuario ADMIN_COMERCIO solo pueda acceder a recursos de SU tienda.
- * 3. Si una tienda está SUSPENDIDA, se bloquee el flujo de checkout.
+ * 3. Si un ADMIN_COMERCIO intenta acceder o alterar datos de otro comercio (BOLA/IDOR), se rechaza con 403.
+ * 4. Si una tienda está SUSPENDIDA, se bloquea el flujo de checkout público con 403 STORE_SUSPENDED.
  */
 
 import { Request, Response, NextFunction } from 'express';
@@ -27,7 +28,7 @@ export function resolveTenant(req: Request, _res: Response, next: NextFunction):
     }
   }
 
-  // Si el usuario es ADMIN_COMERCIO, su tenant principal es su propio storeId
+  // Si el usuario autenticado es ADMIN_COMERCIO, su storeId autorizado prevalece
   if (req.user && req.user.role === 'ADMIN_COMERCIO' && req.user.storeId) {
     storeId = req.user.storeId;
   }
@@ -38,29 +39,47 @@ export function resolveTenant(req: Request, _res: Response, next: NextFunction):
 
 /**
  * Valida que el usuario tenga autorización para operar sobre el storeId solicitado.
- * Si es SUPERADMIN permite el acceso.
- * Si es ADMIN_COMERCIO, verifica coincidencia estricta con req.user.storeId.
+ * - SUPERADMIN: Acceso global permitido.
+ * - ADMIN_COMERCIO: Requiere coincidencia estricta entre req.user.storeId y todos los parámetros del request (params, body, query).
+ * - CLIENTE: Denegado en rutas protegidas de administración.
  */
 export function enforceTenantIsolation(req: Request, res: Response, next: NextFunction): void {
   if (!req.user) {
     res.status(401).json({
       success: false,
-      error: { code: 'UNAUTHORIZED', message: 'Autenticación requerida' },
+      error: { code: 'UNAUTHORIZED', message: 'Autenticación requerida para acceder a este recurso.' },
     });
     return;
   }
 
-  // SuperAdmin puede acceder a cualquier tienda
+  // SuperAdmin tiene acceso a toda la plataforma
   if (req.user.role === 'SUPERADMIN') {
     next();
     return;
   }
 
-  // Admin de comercio debe coincidir exactamente con el storeId del recurso
-  const targetStoreId = req.params.storeId || req.body?.storeId || req.query?.storeId || req.storeId;
+  // Cliente no puede realizar acciones de administración de comercio
+  if (req.user.role === 'CLIENTE') {
+    res.status(403).json({
+      success: false,
+      error: { code: 'FORBIDDEN', message: 'Los clientes no tienen permisos administrativos.' },
+    });
+    return;
+  }
 
+  // Admin de comercio: Validar aislamiento estricto
   if (req.user.role === 'ADMIN_COMERCIO') {
-    if (!req.user.storeId || (targetStoreId && targetStoreId !== req.user.storeId)) {
+    const userStoreId = req.user.storeId;
+    if (!userStoreId) {
+      res.status(403).json({
+        success: false,
+        error: { code: 'TENANT_NOT_ASSIGNED', message: 'El usuario no tiene una tienda asignada.' },
+      });
+      return;
+    }
+
+    // Verificar en params
+    if (req.params.storeId && req.params.storeId !== userStoreId) {
       res.status(403).json({
         success: false,
         error: {
@@ -70,6 +89,33 @@ export function enforceTenantIsolation(req: Request, res: Response, next: NextFu
       });
       return;
     }
+
+    // Verificar en body si se intenta alterar o asignar otro storeId
+    if (req.body && req.body.storeId && req.body.storeId !== userStoreId) {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: 'TENANT_ACCESS_DENIED',
+          message: 'Violación de aislamiento multi-tenant: Intento de alteración de storeId en payload.',
+        },
+      });
+      return;
+    }
+
+    // Verificar en query si se solicita filtrar por otro storeId
+    if (req.query && req.query.storeId && req.query.storeId !== userStoreId) {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: 'TENANT_ACCESS_DENIED',
+          message: 'Violación de aislamiento multi-tenant: Filtro no autorizado para otro comercio.',
+        },
+      });
+      return;
+    }
+
+    // Fijar storeId verificado en request
+    req.storeId = userStoreId;
   }
 
   next();
@@ -79,7 +125,7 @@ export function enforceTenantIsolation(req: Request, res: Response, next: NextFu
  * Verifica si la tienda está activa antes de procesar operaciones públicas (e.g. checkout).
  */
 export function requireActiveStore(req: Request, res: Response, next: NextFunction): void {
-  const storeId = req.storeId || req.params.storeId || req.body?.storeId;
+  const storeId = req.params.storeId || req.storeId || req.body?.storeId;
   
   if (!storeId) {
     next();
