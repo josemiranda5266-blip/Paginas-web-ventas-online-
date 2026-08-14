@@ -1,6 +1,6 @@
 {
-  "name": "Plataforma SaaS E-commerce Multi-Tienda",
-  "description": "Plataforma web multi-cliente para creación y gestión de tiendas online independientes con panel SuperAdmin, panel de comercio y catálogo público.",
+  "name": "Paginas Web Ventas Online",
+  "description": "Plataforma SaaS de comercio electrónico multi-tenant para creación y gestión de tiendas online independientes con panel SuperAdmin, panel de comercio y catálogo público.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

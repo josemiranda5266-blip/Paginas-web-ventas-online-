@@ -1,0 +1,376 @@
+// Prisma Schema para PostgreSQL - SaaS Multi-Tenant "Paginas Web Ventas Online"
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum UserRole {
+  SUPERADMIN
+  ADMIN_COMERCIO
+  CLIENTE
+}
+
+enum StoreStatus {
+  PENDIENTE
+  ACTIVO
+  SUSPENDIDO
+}
+
+enum OrderStatus {
+  PENDIENTE
+  CONFIRMADO
+  PREPARANDO
+  ENVIADO
+  ENTREGADO
+  CANCELADO
+}
+
+enum PaymentProvider {
+  MERCADOPAGO
+  TRANSFER
+  CASH_ON_DELIVERY
+}
+
+enum PaymentStatus {
+  PENDING
+  APPROVED
+  IN_PROCESS
+  REJECTED
+  CANCELLED
+  REFUNDED
+}
+
+enum DeliveryMethod {
+  PICKUP
+  DELIVERY
+}
+
+enum PromotionType {
+  PERCENTAGE
+  FIXED_PRICE
+}
+
+// 1. Usuarios del sistema (Superadmin, Administrador de comercio, o Cliente registrado)
+model User {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String
+  name         String
+  role         UserRole  @default(CLIENTE)
+  phone        String?
+  storeId      String?
+  store        Store?    @relation(fields: [storeId], references: [id], onDelete: SetNull)
+  customers    Customer[]
+  auditLogs    AuditLog[]
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([storeId])
+  @@index([role])
+}
+
+// 2. Comercio / Tienda (Tenant aislado)
+model Store {
+  id                   String                 @id @default(uuid())
+  slug                 String                 @unique
+  name                 String
+  description          String?
+  logo                 String?
+  banner               String?
+  phone                String?
+  email                String?
+  address              String?
+  schedule             String?
+  primaryColor         String                 @default("#2563eb")
+  secondaryColor       String                 @default("#1e293b")
+  status               StoreStatus            @default(PENDIENTE)
+  
+  // Relaciones
+  settings             StoreSettings?
+  subscription         Subscription?
+  users                User[]
+  categories           Category[]
+  products             Product[]
+  orders               Order[]
+  customers            Customer[]
+  promotions           Promotion[]
+  mercadoPago          MercadoPagoConnection?
+  webhookEvents        WebhookEvent[]
+  auditLogs            AuditLog[]
+
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime               @updatedAt
+
+  @@index([slug])
+  @@index([status])
+}
+
+// 3. Configuración de la tienda
+model StoreSettings {
+  id                   String    @id @default(uuid())
+  storeId              String    @unique
+  store                Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  shippingCost         Decimal   @default(0.0) @db.Decimal(10, 2)
+  freeShippingMinAmount Decimal  @default(0.0) @db.Decimal(10, 2)
+  minOrderAmount       Decimal   @default(0.0) @db.Decimal(10, 2)
+  allowPickup          Boolean   @default(true)
+  allowDelivery        Boolean   @default(true)
+  acceptCashOnDelivery Boolean   @default(false)
+  acceptBankTransfer   Boolean   @default(false)
+  bankName             String?
+  bankAccountHolder    String?
+  bankAccountNumber    String?
+  bankCbuCvu           String?
+  bankAlias            String?
+  instagramUrl         String?
+  facebookUrl          String?
+  whatsappNumber       String?
+  websiteUrl           String?
+  updatedAt            DateTime  @updatedAt
+}
+
+// 4. Conexión OAuth de Mercado Pago por comercio
+model MercadoPagoConnection {
+  id                    String    @id @default(uuid())
+  storeId               String    @unique
+  store                 Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  mpUserId              String    // ID del vendedor en Mercado Pago
+  accessTokenEncrypted  String    // Access token encriptado en el backend
+  refreshTokenEncrypted String?   // Refresh token encriptado
+  publicKey             String?   // Public key para inicialización cliente si aplica
+  expiresAt             DateTime?
+  active                Boolean   @default(true)
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([mpUserId])
+}
+
+// 5. Categorías de productos (por comercio)
+model Category {
+  id          String    @id @default(uuid())
+  storeId     String
+  store       Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  name        String
+  slug        String
+  description String?
+  active      Boolean   @default(true)
+  sortOrder   Int       @default(0)
+  products    Product[]
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([storeId, slug])
+  @@index([storeId])
+}
+
+// 6. Productos (por comercio)
+model Product {
+  id             String      @id @default(uuid())
+  storeId        String
+  store          Store       @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  categoryId     String
+  category       Category    @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  name           String
+  slug           String
+  sku            String?
+  description    String?
+  price          Decimal     @db.Decimal(10, 2)
+  compareAtPrice Decimal?    @db.Decimal(10, 2)
+  stock          Int         @default(0)
+  minStock       Int         @default(0)
+  images         String[]
+  active         Boolean     @default(true)
+  featured       Boolean     @default(false)
+  orderItems     OrderItem[]
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@unique([storeId, slug])
+  @@index([storeId])
+  @@index([categoryId])
+}
+
+// 7. Clientes (Compradores)
+model Customer {
+  id        String    @id @default(uuid())
+  storeId   String
+  store     Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  userId    String?
+  user      User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  firstName String
+  lastName  String
+  email     String
+  phone     String?
+  addresses Address[]
+  orders    Order[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([storeId, email])
+}
+
+// 8. Direcciones de entrega de clientes
+model Address {
+  id         String    @id @default(uuid())
+  customerId String
+  customer   Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  address    String
+  city       String
+  province   String
+  postalCode String
+  notes      String?
+  isDefault  Boolean   @default(false)
+  orders     Order[]
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@index([customerId])
+}
+
+// 9. Pedidos (Ordenes de compra)
+model Order {
+  id             String          @id @default(uuid())
+  orderNumber    String
+  storeId        String
+  store          Store           @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  customerId     String
+  customer       Customer        @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  addressId      String?
+  address        Address?        @relation(fields: [addressId], references: [id], onDelete: SetNull)
+  deliveryMethod DeliveryMethod  @default(DELIVERY)
+  subtotal       Decimal         @db.Decimal(10, 2)
+  shippingCost   Decimal         @default(0.0) @db.Decimal(10, 2)
+  total          Decimal         @db.Decimal(10, 2)
+  status         OrderStatus     @default(PENDIENTE)
+  notes          String?
+  items          OrderItem[]
+  payments       Payment[]
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@unique([storeId, orderNumber])
+  @@index([storeId])
+  @@index([customerId])
+  @@index([status])
+}
+
+// 10. Items de cada Pedido (con precio histórico congelado)
+model OrderItem {
+  id        String   @id @default(uuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  name      String   // Nombre histórico
+  sku       String?  // SKU histórico
+  price     Decimal  @db.Decimal(10, 2) // Precio unitario congelado
+  quantity  Int
+  subtotal  Decimal  @db.Decimal(10, 2)
+  image     String?
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+// 11. Pagos (Entidad separada de Order para soportar múltiples intentos, webhooks y pasarelas)
+model Payment {
+  id             String          @id @default(uuid())
+  orderId        String
+  order          Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  storeId        String
+  provider       PaymentProvider
+  externalId     String?         // ID de pago en Mercado Pago (payment_id / preference_id)
+  status         PaymentStatus   @default(PENDING)
+  amount         Decimal         @db.Decimal(10, 2)
+  currency       String          @default("ARS")
+  paymentMethod  String?         // e.g. "credit_card", "ticket", "bank_transfer"
+  paidAt         DateTime?
+  rawResponse    Json?           // Payload devuelto por el Webhook para auditoría
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([orderId])
+  @@index([storeId])
+  @@index([externalId])
+  @@index([status])
+}
+
+// 12. Promociones
+model Promotion {
+  id        String        @id @default(uuid())
+  storeId   String
+  store     Store         @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  name      String
+  type      PromotionType @default(PERCENTAGE)
+  value     Decimal       @db.Decimal(10, 2)
+  active    Boolean       @default(true)
+  startDate DateTime?
+  endDate   DateTime?
+  createdAt DateTime      @default(now())
+
+  @@index([storeId])
+}
+
+// 13. Registro de Auditoría para Seguridad y Trazabilidad
+model AuditLog {
+  id        String   @id @default(uuid())
+  storeId   String?
+  store     Store?   @relation(fields: [storeId], references: [id], onDelete: SetNull)
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String   // e.g., "STORE_SUSPENDED", "ORDER_STATUS_CHANGED", "MP_CONNECTED"
+  entity    String   // e.g., "Order", "Store", "Product"
+  entityId  String?
+  details   Json?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([storeId])
+  @@index([userId])
+  @@index([action])
+}
+
+// 14. Eventos de Webhook Idempotentes (Mercado Pago u otros proveedores)
+model WebhookEvent {
+  id          String   @id @default(uuid())
+  provider    String   @default("MERCADOPAGO")
+  eventId     String   @unique // ID único enviado por Mercado Pago para asegurar idempotencia
+  eventType   String   // e.g. "payment", "merchant_order"
+  storeId     String?
+  store       Store?   @relation(fields: [storeId], references: [id], onDelete: SetNull)
+  status      String   @default("PROCESSED") // PROCESSED, FAILED, IGNORED
+  payload     Json
+  processedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  @@index([eventId])
+  @@index([storeId])
+  @@index([status])
+}
+
+// 15. Suscripción Mensual Fija de la Plataforma SaaS (0% de comisión en ventas del comercio)
+model Subscription {
+  id                 String   @id @default(uuid())
+  storeId            String   @unique
+  store              Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  planName           String   @default("SaaS Mensual Base")
+  amount             Decimal  @default(15000.0) @db.Decimal(10, 2)
+  currency           String   @default("ARS")
+  status             String   @default("ACTIVE") // ACTIVE, TRIAL, PAST_DUE, CANCELLED
+  interval           String   @default("MONTHLY")
+  commissionRate     Decimal  @default(0.0) @db.Decimal(5, 2) // Estricto 0.00% comisión por ventas
+  currentPeriodStart DateTime @default(now())
+  currentPeriodEnd   DateTime
+  cancelAtPeriodEnd  Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([storeId])
+  @@index([status])
+}
+
